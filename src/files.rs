@@ -1,3 +1,4 @@
+use crate::search::{get_classes_regex, get_spacing_declaration_regex};
 use crate::values::length_to_px;
 
 use regex::Regex;
@@ -9,6 +10,7 @@ use std::{
 };
 use tempfile::NamedTempFile;
 
+/// Returns a boolean - The directory should be ignored when return is true, and should be searched when return is false
 pub fn should_ignore_dir(dir_name: &str) -> bool {
     dir_name.starts_with(".")
         || ["node_modules", "dist", "build"]
@@ -16,6 +18,7 @@ pub fn should_ignore_dir(dir_name: &str) -> bool {
             .any(|ignore| dir_name == *ignore)
 }
 
+/// Returns a boolean - The file should be searched when return is true, and should be ignored when return is false
 pub fn is_tw_file(file_name: &str) -> bool {
     [".tsx", ".ts", ".js", ".jsx", ".html", ".scss", ".css"]
         .iter()
@@ -28,27 +31,23 @@ pub fn is_tw_file(file_name: &str) -> bool {
 /// ### Returns
 /// `Result<(Vec<String>, Vec<String>), Error>`
 ///
-/// The tupple contains two vectors. The first is a vector of all css files. The second is a vector of all other files.
+/// The tuple contains two vectors. The first is a vector of all css files.
+/// The second is a vector of all other files that should be searched for tailwind classes.
 /// This distinction is to help find the css file that defines the spacing as --spacing
 pub fn get_tw_files(
-    dir: &String,
+    dir: &PathBuf,
     css_res: &mut Vec<PathBuf>,
     res: &mut Vec<PathBuf>,
 ) -> Result<(), Error> {
     let dir_entries = fs::read_dir(dir)?;
 
     for _entry in dir_entries {
-        let entry = match _entry {
-            Ok(entry) => entry,
-            Err(e) => panic!(
-                "DirEntry has an error. Please try to figure this out, lol.\nError: {:?}",
-                e
-            ),
-        };
+        let entry = _entry.expect(&format!(
+            "DirEntry has an error. Please try to figure this out, lol."
+        ));
 
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            let dir = entry.path().into_os_string().into_string().unwrap();
             if !should_ignore_dir(&entry.file_name().into_string().unwrap()) {
                 get_tw_files(&dir, css_res, res)?;
             }
@@ -59,12 +58,10 @@ pub fn get_tw_files(
             continue;
         }
 
-        let file_name = match entry.file_name().into_string() {
-            Ok(v) => v,
-            Err(os_str) => {
-                panic!("File name {:?} cannot be processed as a String", os_str)
-            }
-        };
+        let file_name = entry.file_name().into_string().unwrap_or_else(|os_str| {
+            eprintln!("File name {:?} cannot be processed as a String", os_str);
+            panic!();
+        });
 
         if file_name.ends_with(".css") {
             css_res.push(entry.path());
@@ -76,10 +73,11 @@ pub fn get_tw_files(
     Ok(())
 }
 
-/// ### Returns
-/// A tuple where:
-/// `tuple.0` -> A vector of paths to the files with `--spacing` definitions
-/// `tuple.1` -> The value of the current spacing in `px`
+/// Returns a tuple `res`, where:
+///
+/// `res.0` -> A vector of paths to the files with `--spacing` definitions
+///
+/// `res.1` -> The value of the current spacing in `px`
 pub fn find_curr_spacing(css_files: &Vec<PathBuf>) -> (Vec<PathBuf>, i32) {
     let mut res = (vec![], 0);
 
@@ -108,8 +106,9 @@ pub fn find_curr_spacing(css_files: &Vec<PathBuf>) -> (Vec<PathBuf>, i32) {
     res
 }
 
-/// Runs a preflight check on all files that might be edited to make sure that they're not locked, and are editable
-pub fn check_locked_files(files: &Vec<PathBuf>) {
+/// Runs a preflight check on all files that might be edited to make sure that they're not locked, and that the user
+/// has sufficient permissions to open all files involved
+fn check_locked_files(files: &Vec<PathBuf>) {
     for file in files {
         match OpenOptions::new().write(true).open(&file) {
             Ok(_f) => (),
@@ -125,62 +124,142 @@ pub fn check_locked_files(files: &Vec<PathBuf>) {
     println!("No files locked, proceeding to update spacing!")
 }
 
-fn get_classes_regex() -> Regex {
-    let bidirectional_properties = [
-        "m",
-        "my",
-        "mx",
-        "mt",
-        "mr",
-        "mb",
-        "ml",
-        "ms",
-        "me",
-        "inset",
-        "top",
-        "left",
-        "bottom",
-        "right",
-        "start",
-        "end",
-        "spacing",
-        "spacing\\-x",
-        "spacing\\-y",
-    ]
-    .map(|s| String::from(s));
-    let negative_properties = bidirectional_properties
-        .iter()
-        .map(|prop| format!("-{prop}"))
-        .collect::<Vec<String>>();
+/// Update the content of a file that uses tailwind classes
+///
+/// Returns
+///
+///
+fn get_updated_content_in_tw_file(
+    file_content: &str,
+    current_spacing: i32,
+    target_spacing: i32,
+    file_updates_count: &mut i32,
+) -> String {
+    let conversion_rate = current_spacing as f64 / target_spacing as f64;
+    let classes_regex = get_classes_regex();
+    let captures_iter = classes_regex.captures_iter(&file_content);
 
-    let positive_only_properties = [
-        "p", "py", "px", "pt", "pr", "pb", "pl", "ps", "pe", "h", "w", "max\\-h", "max\\-w",
-        "min\\-h", "min\\-w", "basis", "gap", "gap\\-y", "gap\\-x", "size",
-    ]
-    .map(|s| String::from(s));
+    let mut prev_end = 0;
+    let mut updated_file_content = String::with_capacity(file_content.len() + 100);
 
-    let property_exp = [
-        &bidirectional_properties[..],
-        &negative_properties[..],
-        &positive_only_properties[..],
-    ]
-    .concat()
-    .join("|");
+    for capture_group in captures_iter {
+        if file_content.as_bytes()[capture_group.get_match().end()] == b'/' {
+            continue;
+        }
 
-    let exp = format!(r"\W(?:{property_exp})\-(\d+(?:\.\d+)?)");
+        let coef_match = capture_group
+            .get(1)
+            .expect(&format!("Couldn't get capture_group[1]: {capture_group:?}"));
 
-    println!("Using the following regex to find classes that use spacing: {exp}");
+        updated_file_content += &file_content[prev_end..coef_match.start()];
+        prev_end = coef_match.end();
 
-    match Regex::new(&exp) {
-        Ok(r) => r,
-        Err(e) => panic!("Error getting classes regex!\n\n{e}"),
+        let curr_coef = coef_match.as_str().parse::<f64>().expect(&format!(
+            "Failed to parse spacing coefficient in classname `{}` (tried to parse: `{}`)",
+            capture_group.get_match().as_str(),
+            coef_match.as_str()
+        ));
+
+        let new_coef = curr_coef * conversion_rate;
+        let new_value_str = match new_coef - new_coef.floor() {
+            0.0 | 0.25 | 0.5 | 0.75 => new_coef.to_string(),
+            _ => format!("[{}px]", curr_coef * current_spacing as f64),
+        };
+        updated_file_content += &new_value_str;
+
+        *file_updates_count += 1;
     }
+
+    updated_file_content += &file_content[prev_end..];
+    updated_file_content
 }
 
 /// ### Params
-/// *target_files*: &Vec<String> - vector of strings each representing the path to a file that uses tailwind classes
-/// *current_spacing*: f64 - the current value (in the codebase) of the --spacing variable in rem
-/// *target_spacing*: f64 - the desired value of the --spacing variable in rem (classes will now be using this number)
+/// `file_content`: content of the file
+///
+/// `target_spacing_arg`: target value for --spacing as entered by the user
+///
+/// `files_updates_count`: mutable reference to a variable that gets incremented with each change in
+///
+/// **Returns** the updated file content for a file that might contain a css --spacing declaration
+fn get_updated_content_in_css_config_file(
+    file_content: &str,
+    target_spacing_arg: &str,
+    file_updates_count: &mut i32,
+) -> String {
+    let spacing_declaration_regex = get_spacing_declaration_regex();
+    let captures_iter = spacing_declaration_regex.captures_iter(&file_content);
+
+    let mut updated_file_content = String::with_capacity(file_content.len() + 100);
+    let mut prev_end = 0;
+
+    for capture_group in captures_iter {
+        let length_match = &capture_group.get(1).unwrap();
+
+        updated_file_content += &file_content[prev_end..length_match.start()];
+        prev_end = length_match.end();
+        updated_file_content += target_spacing_arg;
+
+        *file_updates_count += 1;
+    }
+    updated_file_content += &file_content[prev_end..];
+
+    updated_file_content
+}
+
+/// ### Params
+/// `curr_file`: the file that this tmp file corresponds to
+///
+/// `content`: content of the new tmp file
+/// **Returns** The temp file object
+fn create_tmp_file(curr_file: &PathBuf, content: &str) -> NamedTempFile {
+    let mut tmp =
+        NamedTempFile::with_prefix_in(curr_file.file_stem().unwrap(), curr_file.parent().unwrap())
+            .unwrap_or_else(|err| {
+                eprintln!("Couldn't create tmp file for {curr_file:?}\n\n{err:?}");
+                panic!()
+            });
+
+    tmp.write(content.as_bytes()).unwrap_or_else(|err| {
+        eprintln!("Couldn't write to tmp file for {curr_file:?}\n\n{err:?}");
+        panic!()
+    });
+
+    tmp
+}
+
+/// ### Params
+/// `targets`: a vector of the paths that the tmp files will be saved to
+///
+/// `optional_tmp_files`: a vector of Option objects. When there is Some(tmp_file), the tmp_file will replace
+/// its corresponding file from the `targets` vector. Otherwise, nothing happens
+///
+/// **Returns** a result of nothing, or an error
+fn save_optional_tmp_files(
+    targets: &Vec<PathBuf>,
+    optional_tmp_files: &Vec<Option<NamedTempFile>>,
+) -> Result<(), Error> {
+    for (curr_file, tmp) in targets.iter().zip(optional_tmp_files) {
+        if tmp.is_some() {
+            fs::rename(tmp.as_ref().unwrap(), curr_file)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// ### Params
+/// `current_spacing: i32` - the current value (in the codebase) of the --spacing variable in px
+///
+/// `target_spacing_arg: string` - the target spacing as entered by the user (including the unit)
+///
+/// `css_files: &Vec<PathBuf>` - vector of paths each representing the path to a file that uses tailwind classes
+///
+/// `target_files: &Vec<PathBuf>` - vector of paths each representing the path to a file that uses tailwind classes
+///
+/// ### Returns
+/// `io::Result<(i32, i32)>` - A Result containing a tuple. The first element is the number of classes updated,
+/// and the second element is the number of files updated.
 pub fn update_spacing(
     current_spacing: i32,
     target_spacing_arg: &str,
@@ -192,8 +271,6 @@ pub fn update_spacing(
     assert_ne!(current_spacing, 0);
     assert_ne!(target_spacing, 0);
 
-    let conversion_rate = current_spacing as f64 / target_spacing as f64;
-    let classes_regex = get_classes_regex();
     let all_targets = [target_files.as_slice(), css_files.as_slice()].concat();
 
     let mut tmp_files: Vec<Option<NamedTempFile>> = Vec::with_capacity(all_targets.len());
@@ -205,72 +282,30 @@ pub fn update_spacing(
     // Iterate over files that use tailwind classes to update all classes that use the spacing variable
     for curr_file in all_targets.iter() {
         let file_content = fs::read_to_string(&curr_file)?;
-        let captures_iter = classes_regex.captures_iter(&file_content);
-
-        let mut updated_file_content = String::with_capacity(file_content.len() + 100);
-        let mut prev_end = 0;
         let mut file_updates_count = 0;
 
-        for capture_group in captures_iter {
-            if file_content.as_bytes()[capture_group.get_match().end()] == b'/' {
-                continue;
-            }
-
-            let coef_match = capture_group
-                .get(1)
-                .expect(&format!("Couldn't get capture_group[1]: {capture_group:?}"));
-            updated_file_content += &file_content[prev_end..coef_match.start()];
-            prev_end = coef_match.end();
-
-            let curr_coef = coef_match.as_str().parse::<f64>().expect(&format!(
-                "Failed to parse spacing coefficient in classname `{}` (tried to parse: `{}`)",
-                capture_group.get_match().as_str(),
-                coef_match.as_str()
-            ));
-
-            let new_coef = curr_coef * conversion_rate;
-            let new_value_str = match new_coef - new_coef.floor() {
-                0.0|0.25|0.5|0.75 => new_coef.to_string(),
-                _ => format!("[{}px]", curr_coef * current_spacing as f64)
-            };
-
-            updated_file_content += &new_value_str;
-            file_updates_count += 1;
-        }
+        // update tailwind classes in all target files
+        let mut updated_file_content = get_updated_content_in_tw_file(
+            &file_content,
+            current_spacing,
+            target_spacing,
+            &mut file_updates_count,
+        );
 
         classes_updated_count += file_updates_count;
 
         // If the file is in the css_config_files array then update --spacing
         if css_files.iter().any(|f| *f == *curr_file) {
-            let spacing_declaration_regex = Regex::new(r"--spacing:\s*((\d+(?:\.\d+)?)(px|rem))")
-                .expect("--spacing declaration regex not valid lollll");
-            let captures_iter = spacing_declaration_regex.captures_iter(&file_content);
-
-            for capture_group in captures_iter {
-                let length_match = &capture_group.get(1).unwrap();
-
-                updated_file_content += &file_content[prev_end..length_match.start()];
-                prev_end = length_match.end();
-                updated_file_content += target_spacing_arg;
-
-                file_updates_count += 1;
-            }
+            updated_file_content = get_updated_content_in_css_config_file(
+                &updated_file_content,
+                target_spacing_arg,
+                &mut file_updates_count,
+            );
         }
 
-        // If any matches were found (and changes were made)
+        // If any changes were made, save them to a temp file
         if file_updates_count > 0 {
-            updated_file_content += &file_content[prev_end..];
-
-            let mut tmp = NamedTempFile::with_prefix_in(
-                curr_file.file_stem().unwrap(),
-                curr_file.parent().unwrap(),
-            )
-            .expect(&format!(
-                "Couldn't unwrap cur_file.file_name() for {curr_file:?}"
-            ));
-            tmp.write(updated_file_content.as_bytes())?;
-            tmp_files.push(Some(tmp));
-
+            tmp_files.push(Some(create_tmp_file(curr_file, &updated_file_content)));
             files_updated_count += 1;
         } else {
             tmp_files.push(None);
@@ -278,11 +313,7 @@ pub fn update_spacing(
     }
 
     // Replace files with tmp files
-    for (curr_file, tmp) in all_targets.iter().zip(tmp_files) {
-        if tmp.is_some() {
-            fs::rename(tmp.unwrap(), curr_file)?;
-        }
-    }
+    save_optional_tmp_files(&all_targets, &tmp_files)?;
 
     // Iterate over files that define
     Ok((classes_updated_count, files_updated_count))

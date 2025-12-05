@@ -46,8 +46,6 @@ pub fn get_classes_regex() -> Regex {
 
     let exp = format!(r"\W(?:{property_exp})\-(\d+(?:\.\d+)?)");
 
-    println!("Using the following regex to find classes that use spacing: {exp}");
-
     Regex::new(&exp).unwrap_or_else(|err| {
         eprintln!("--spacing declaration regex not valid lollll\n{err:?}");
         panic!()

@@ -1,5 +1,5 @@
+use crate::css_length::length_to_px;
 use crate::search::{get_classes_regex, get_spacing_declaration_regex};
-use crate::values::length_to_px;
 
 use regex::Regex;
 use std::{
@@ -49,7 +49,7 @@ pub fn get_tw_files(
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
             if !should_ignore_dir(&entry.file_name().into_string().unwrap()) {
-                get_tw_files(&dir, css_res, res)?;
+                get_tw_files(&entry.path(), css_res, res)?;
             }
             continue;
         }
@@ -134,9 +134,9 @@ fn get_updated_content_in_tw_file(
     current_spacing: i32,
     target_spacing: i32,
     file_updates_count: &mut i32,
+    classes_regex: &Regex,
 ) -> String {
     let conversion_rate = current_spacing as f64 / target_spacing as f64;
-    let classes_regex = get_classes_regex();
     let captures_iter = classes_regex.captures_iter(&file_content);
 
     let mut prev_end = 0;
@@ -186,8 +186,8 @@ fn get_updated_content_in_css_config_file(
     file_content: &str,
     target_spacing_arg: &str,
     file_updates_count: &mut i32,
+    spacing_declaration_regex: &Regex,
 ) -> String {
-    let spacing_declaration_regex = get_spacing_declaration_regex();
     let captures_iter = spacing_declaration_regex.captures_iter(&file_content);
 
     let mut updated_file_content = String::with_capacity(file_content.len() + 100);
@@ -205,6 +205,40 @@ fn get_updated_content_in_css_config_file(
     updated_file_content += &file_content[prev_end..];
 
     updated_file_content
+}
+
+fn get_updated_file_content(
+    file_content: &str,
+    current_spacing: i32,
+    target_spacing: i32,
+    target_spacing_arg: &str,
+    classes_regex: &Regex,
+    spacing_declaration_regex: &Regex,
+    is_css: bool,
+) -> (String, i32, i32) {
+    let mut file_updates_count = 0;
+    let mut class_updates_count = 0;
+
+    // update tailwind classes in all target files
+    let mut updated_file_content = get_updated_content_in_tw_file(
+        &file_content,
+        current_spacing,
+        target_spacing,
+        &mut class_updates_count,
+        &classes_regex,
+    );
+
+    // If the file is in the css_config_files array then update --spacing
+    if is_css {
+        updated_file_content = get_updated_content_in_css_config_file(
+            &updated_file_content,
+            target_spacing_arg,
+            &mut file_updates_count,
+            &spacing_declaration_regex,
+        );
+    }
+
+    (updated_file_content, file_updates_count + class_updates_count, class_updates_count)
 }
 
 /// ### Params
@@ -273,6 +307,9 @@ pub fn update_spacing(
 
     let all_targets = [target_files.as_slice(), css_files.as_slice()].concat();
 
+    let classes_regex = get_classes_regex();
+    let spacing_declaration_regex = get_spacing_declaration_regex();
+
     let mut tmp_files: Vec<Option<NamedTempFile>> = Vec::with_capacity(all_targets.len());
     let mut classes_updated_count = 0;
     let mut files_updated_count = 0;
@@ -281,32 +318,23 @@ pub fn update_spacing(
 
     // Iterate over files that use tailwind classes to update all classes that use the spacing variable
     for curr_file in all_targets.iter() {
-        let file_content = fs::read_to_string(&curr_file)?;
-        let mut file_updates_count = 0;
+        let file_content = fs::read_to_string(curr_file)?;
 
-        // update tailwind classes in all target files
-        let mut updated_file_content = get_updated_content_in_tw_file(
+        let (updated_file_content, file_updates_count, file_class_updates_count) = get_updated_file_content(
             &file_content,
             current_spacing,
             target_spacing,
-            &mut file_updates_count,
+            target_spacing_arg,
+            &classes_regex,
+            &spacing_declaration_regex,
+            css_files.iter().any(|path| *path == *curr_file),
         );
-
-        classes_updated_count += file_updates_count;
-
-        // If the file is in the css_config_files array then update --spacing
-        if css_files.iter().any(|f| *f == *curr_file) {
-            updated_file_content = get_updated_content_in_css_config_file(
-                &updated_file_content,
-                target_spacing_arg,
-                &mut file_updates_count,
-            );
-        }
 
         // If any changes were made, save them to a temp file
         if file_updates_count > 0 {
             tmp_files.push(Some(create_tmp_file(curr_file, &updated_file_content)));
             files_updated_count += 1;
+            classes_updated_count += file_class_updates_count;
         } else {
             tmp_files.push(None);
         };

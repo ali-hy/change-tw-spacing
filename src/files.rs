@@ -11,7 +11,7 @@ use std::{
 use tempfile::NamedTempFile;
 
 /// Returns a boolean - The directory should be ignored when return is true, and should be searched when return is false
-pub fn should_ignore_dir(dir_name: &str) -> bool {
+fn should_ignore_dir(dir_name: &str) -> bool {
     dir_name.starts_with(".")
         || ["node_modules", "dist", "build"]
             .iter()
@@ -19,7 +19,7 @@ pub fn should_ignore_dir(dir_name: &str) -> bool {
 }
 
 /// Returns a boolean - The file should be searched when return is true, and should be ignored when return is false
-pub fn is_tw_file(file_name: &str) -> bool {
+fn is_tw_file(file_name: &str) -> bool {
     [".tsx", ".ts", ".js", ".jsx", ".html", ".scss", ".css"]
         .iter()
         .any(|suff| file_name.ends_with(suff))

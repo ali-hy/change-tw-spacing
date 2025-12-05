@@ -54,6 +54,7 @@ pub fn get_classes_regex() -> Regex {
     })
 }
 
+/// Returns the regex used to match a css declaration of --spacing for tailwind
 pub fn get_spacing_declaration_regex() -> Regex {
     Regex::new(r"--spacing:\s*((\d+(?:\.\d+)?)(px|rem))").unwrap_or_else(|err| {
         eprintln!("--spacing declaration regex not valid lollll\n{err:?}");
